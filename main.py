@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import re
+import os
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import MessageEntityType
@@ -14,10 +15,10 @@ from aiogram.client.default import DefaultBotProperties
 from beanie import Document, init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
-import os
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGODB_URL = os.getenv("MONGODB_URL")
 
 if not BOT_TOKEN or not MONGODB_URL:
@@ -40,7 +41,6 @@ class RecurringMessage(BaseModel):
     interval: int
     last_sent: float = 0
 
-
 class GroupConfig(Document):
     chat_id: str
     recurring_data: list[RecurringMessage] = []
@@ -51,17 +51,14 @@ class GroupConfig(Document):
     class Settings:
         name = "groups"
 
-
 # ================ STATES ================
 class PanelStates(StatesGroup):
     waiting_banned_word = State()
-
 
 class RecurringStates(StatesGroup):
     waiting_content = State()
     waiting_interval = State()
     waiting_buttons = State()
-
 
 # ================ PANELS ================
 def get_main_panel():
@@ -70,9 +67,7 @@ def get_main_panel():
         [InlineKeyboardButton("🔗 Anti-Link", callback_data="toggle_link"),
          InlineKeyboardButton("🔔 Anti-Mention", callback_data="toggle_mention")],
         [InlineKeyboardButton("🚫 Banned Words", callback_data="banned_words")],
-        [InlineKeyboardButton("⬅️ Close", callback_data="close_panel")]
     ])
-
 
 def get_recurring_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -81,7 +76,6 @@ def get_recurring_panel():
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
 
-
 def get_banned_words_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("➕ Add Word", callback_data="add_banned")],
@@ -89,15 +83,16 @@ def get_banned_words_panel():
         [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
 
-
 # ================ HELPERS ================
 async def is_admin(chat_id: int, user_id: int):
+    """Check if user is admin in given chat."""
+    if user_id == OWNER_ID:
+        return True
     try:
         admins = await bot.get_chat_administrators(chat_id)
         return any(a.user.id == user_id for a in admins)
     except:
         return False
-
 
 def has_link_or_mention(m: types.Message):
     entities = (m.entities or []) + (m.caption_entities or [])
@@ -106,15 +101,13 @@ def has_link_or_mention(m: types.Message):
                       MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION]:
             return True
     text = m.text or m.caption or ""
-    return bool(re.search(r'http[s]?://|www\.|t\.me|@', text))
-
+    return bool(re.search(r"http[s]?://|www\.|t\.me|@", text))
 
 def contains_banned_word(text: str, banned: list):
     if not text or not banned:
         return False
     text = text.lower()
     return any(w.lower() in text for w in banned)
-
 
 # ================ RECURRING LOOP ================
 async def send_recurring(chat_id: int):
@@ -143,38 +136,29 @@ async def send_recurring(chat_id: int):
     if updated:
         await group.save()
 
-
 async def recurring_loop():
     while True:
         await asyncio.sleep(60)
         async for group in GroupConfig.find({"recurring_data.0": {"$exists": True}}):
             asyncio.create_task(send_recurring(int(group.chat_id)))
 
-
-# ================ GROUP HANDLER ================
+# ================ GROUP MESSAGE HANDLER ================
 @dp.message()
 async def handle_message(message: types.Message):
     if message.chat.type not in ["supergroup", "group"]:
         return
-
     chat_id = str(message.chat.id)
     group = await GroupConfig.find_one(GroupConfig.chat_id == chat_id)
     if not group:
         group = GroupConfig(chat_id=chat_id)
         await group.insert()
-
-    # Skip admin messages
     if message.from_user and await is_admin(message.chat.id, message.from_user.id):
         return
-
-    # Anti-link and mention
     if (group.anti_link or group.anti_mention) and has_link_or_mention(message):
         try:
             await message.delete()
         except:
             pass
-
-    # Banned words
     text = message.text or message.caption or ""
     if group.banned_words and contains_banned_word(text, group.banned_words):
         try:
@@ -182,56 +166,49 @@ async def handle_message(message: types.Message):
         except:
             pass
 
-
-# ================ PANEL (DM ONLY FOR ADMINS) ================
+# ================ PANEL COMMAND (DM) ================
 @dp.message(Command("panel"))
 async def panel_cmd(message: types.Message):
+    """Panel can only be used in private chat."""
     if message.chat.type != "private":
-        await message.reply("❌ Use /panel in <b>private chat</b> with me.")
+        await message.reply("❌ Use /panel in private chat with the bot.")
         return
 
-    # Find groups where user is admin
-    groups_text = ""
+    user_id = message.from_user.id
+
+    # allow owner or any admin from any group
     async for group in GroupConfig.find({}):
-        try:
-            admins = await bot.get_chat_administrators(int(group.chat_id))
-            if any(a.user.id == message.from_user.id for a in admins):
-                chat = await bot.get_chat(int(group.chat_id))
-                groups_text += f"• <b>{chat.title}</b>\n"
-        except:
-            continue
+        if await is_admin(int(group.chat_id), user_id):
+            break
+    else:
+        if user_id != OWNER_ID:
+            await message.reply("❌ You must be an admin of at least one group to access the panel.")
+            return
 
-    if not groups_text:
-        await message.reply("⚠️ You are not an admin in any group I manage.")
-        return
-
-    await message.reply(
-        f"<b>🔐 Group Guardian Panel</b>\n"
-        f"You are admin in these groups:\n\n{groups_text}\n"
-        "Select one of your groups and use the buttons below to adjust settings.",
+    await message.answer(
+        "<b>🔐 Group Guardian Panel</b>\nControl your groups from here.",
         reply_markup=get_main_panel()
     )
 
+# ================ CALLBACKS ================
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "<b>🔐 Group Guardian Panel</b>\nControl your groups from here.",
+        reply_markup=get_main_panel()
+    )
 
-@dp.callback_query(lambda c: c.data == "close_panel")
-async def close_panel(callback: CallbackQuery):
-    await callback.message.edit_text("Panel closed ✅")
-
-
-# --- RECURRING ---
-@dp.callback_query(lambda c: c.data == "recurring")
+@dp.callback_query(F.data == "recurring")
 async def panel_recurring(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"<b>📢 Recurring Ads</b>\nManage your group recurring messages.",
+        "<b>📢 Recurring Ads</b>\nManage your scheduled messages.",
         reply_markup=get_recurring_panel()
     )
 
-
-@dp.callback_query(lambda c: c.data == "add_recurring")
+@dp.callback_query(F.data == "add_recurring")
 async def add_recurring_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(RecurringStates.waiting_content)
     await callback.message.edit_text("Send message (text/photo/video):")
-
 
 @dp.message(RecurringStates.waiting_content)
 async def get_content(message: types.Message, state: FSMContext):
@@ -241,18 +218,16 @@ async def get_content(message: types.Message, state: FSMContext):
     elif message.video:
         data.update({"type": "video", "file_id": message.video.file_id})
     await state.update_data(content=data)
-    await message.reply("Interval in minutes:")
+    await message.answer("Interval in minutes:")
     await state.set_state(RecurringStates.waiting_interval)
-
 
 @dp.message(RecurringStates.waiting_interval)
 async def get_interval(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) < 1:
-        return await message.reply("Number > 0")
+        return await message.answer("Please send a number > 0")
     await state.update_data(interval=int(message.text) * 60)
-    await message.reply("Add buttons? (send lines like <code>Text | URL</code> or type 'No')")
+    await message.answer("Add buttons? Send lines as `Text|URL` or send `No`.")
     await state.set_state(RecurringStates.waiting_buttons)
-
 
 @dp.message(RecurringStates.waiting_buttons)
 async def get_buttons(message: types.Message, state: FSMContext):
@@ -266,86 +241,63 @@ async def get_buttons(message: types.Message, state: FSMContext):
     content = data["content"]
     content.update({"buttons": buttons, "interval": data["interval"], "last_sent": 0})
     msg = RecurringMessage(**content)
-
-    # For simplicity, we use first group where user is admin
-    async for group in GroupConfig.find({}):
-        admins = await bot.get_chat_administrators(int(group.chat_id))
-        if any(a.user.id == message.from_user.id for a in admins):
-            group.recurring_data.append(msg)
-            await group.save()
-            await message.reply("✅ Recurring message saved!", reply_markup=get_main_panel())
-            await state.clear()
-            return
-
-    await message.reply("⚠️ You are not admin in any group.")
+    # Save in owner's first group (or new)
+    group = await GroupConfig.find_one({})
+    if not group:
+        group = GroupConfig(chat_id="0")
+    group.recurring_data.append(msg)
+    await group.save()
+    await message.answer("Recurring message saved!", reply_markup=get_main_panel())
     await state.clear()
 
-
-@dp.callback_query(lambda c: c.data == "stop_all_recurring")
+@dp.callback_query(F.data == "stop_all_recurring")
 async def stop_all(callback: CallbackQuery):
-    async for group in GroupConfig.find({}):
-        admins = await bot.get_chat_administrators(int(group.chat_id))
-        if any(a.user.id == callback.from_user.id for a in admins):
-            group.recurring_data = []
-            await group.save()
-            await callback.message.edit_text("✅ All recurring messages stopped.", reply_markup=get_main_panel())
-            return
-    await callback.answer("You are not admin in any group.")
-
+    group = await GroupConfig.find_one({})
+    if group:
+        group.recurring_data = []
+        await group.save()
+    await callback.message.edit_text("All recurring messages stopped.", reply_markup=get_main_panel())
 
 # --- TOGGLES ---
-@dp.callback_query(lambda c: c.data in ["toggle_link", "toggle_mention"])
+@dp.callback_query(F.data.in_(["toggle_link", "toggle_mention"]))
 async def toggle(callback: CallbackQuery):
     field = "anti_link" if callback.data == "toggle_link" else "anti_mention"
-    async for group in GroupConfig.find({}):
-        admins = await bot.get_chat_administrators(int(group.chat_id))
-        if any(a.user.id == callback.from_user.id for a in admins):
-            setattr(group, field, not getattr(group, field))
-            await group.save()
-            await callback.answer(f"{field.replace('_', ' ').title()}: {'ON' if getattr(group, field) else 'OFF'}")
-            return
-    await callback.answer("You are not admin in any group.")
-
+    group = await GroupConfig.find_one({})
+    if not group:
+        group = GroupConfig(chat_id="0")
+    setattr(group, field, not getattr(group, field))
+    await group.save()
+    await callback.answer(f"{field.replace('_', ' ').title()}: {'ON' if getattr(group, field) else 'OFF'}")
 
 # --- BANNED WORDS ---
-@dp.callback_query(lambda c: c.data == "banned_words")
+@dp.callback_query(F.data == "banned_words")
 async def banned_menu(callback: CallbackQuery):
-    await callback.message.edit_text("🚫 Banned Words", reply_markup=get_banned_words_panel())
+    await callback.message.edit_text("🚫 Banned Words Menu", reply_markup=get_banned_words_panel())
 
-
-@dp.callback_query(lambda c: c.data == "add_banned")
+@dp.callback_query(F.data == "add_banned")
 async def add_banned_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(PanelStates.waiting_banned_word)
     await callback.message.edit_text("Send word to ban:")
 
-
 @dp.message(PanelStates.waiting_banned_word)
 async def save_banned(message: types.Message, state: FSMContext):
-    word = message.text.strip().lower()
-    async for group in GroupConfig.find({}):
-        admins = await bot.get_chat_administrators(int(group.chat_id))
-        if any(a.user.id == message.from_user.id for a in admins):
-            if word not in group.banned_words:
-                group.banned_words.append(word)
-                await group.save()
-            await message.reply(f"✅ Banned word added: <code>{word}</code>", reply_markup=get_main_panel())
-            await state.clear()
-            return
-    await message.reply("⚠️ You are not admin in any group.")
+    word = message.text.strip()
+    group = await GroupConfig.find_one({})
+    if not group:
+        group = GroupConfig(chat_id="0")
+    if word not in group.banned_words:
+        group.banned_words.append(word)
+        await group.save()
+    await message.answer(f"Added banned word: <code>{word}</code>", reply_markup=get_main_panel())
     await state.clear()
 
-
-@dp.callback_query(lambda c: c.data == "clear_banned")
+@dp.callback_query(F.data == "clear_banned")
 async def clear_banned(callback: CallbackQuery):
-    async for group in GroupConfig.find({}):
-        admins = await bot.get_chat_administrators(int(group.chat_id))
-        if any(a.user.id == callback.from_user.id for a in admins):
-            group.banned_words = []
-            await group.save()
-            await callback.message.edit_text("✅ All banned words cleared.", reply_markup=get_main_panel())
-            return
-    await callback.answer("You are not admin in any group.")
-
+    group = await GroupConfig.find_one({})
+    if group:
+        group.banned_words = []
+        await group.save()
+    await callback.message.edit_text("All banned words cleared.", reply_markup=get_main_panel())
 
 # ================ STARTUP ================
 async def on_startup():
@@ -356,14 +308,12 @@ async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_my_commands([
         types.BotCommand(command="panel", description="Open control panel (DM only)")
-    ], scope=types.BotCommandScopeDefault())
-
+    ])
 
 async def main():
     dp.startup.register(on_startup)
     asyncio.create_task(recurring_loop())
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
