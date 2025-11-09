@@ -4,15 +4,15 @@ import re
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
-from aiogram.enums import MessageEntityType  # FIXED HERE
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.enums import MessageEntityType
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-import motor.motor_asyncio
+from beanie import Document, init_beanie
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
 import os
 
 # ================= CONFIG =================
@@ -21,19 +21,31 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGODB_URL = os.getenv("MONGODB_URL")
 DB_NAME = "group_guardian"
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# Aiogram
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# MongoDB
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URL)
-db = client[DB_NAME]
-groups = db.groups
+# ================ BEANIE MODELS ================
+class RecurringMessage(BaseModel):
+    type: str  # text, photo, video
+    text: str
+    file_id: str | None = None
+    buttons: list[dict] = []
+    interval: int  # seconds
+    last_sent: float = 0
+
+class GroupConfig(Document):
+    chat_id: str
+    recurring_data: list[RecurringMessage] = []
+    anti_link: bool = True
+    anti_mention: bool = True
+    banned_words: list[str] = []
+
+    class Settings:
+        name = "groups"
 
 # ================ STATES ================
 class PanelStates(StatesGroup):
@@ -55,10 +67,9 @@ def get_main_panel():
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def get_recurring_panel(count: int = 0):
+def get_recurring_panel():
     kb = [
         [InlineKeyboardButton("Add New", callback_data="add_recurring")],
-        [InlineKeyboardButton("List & Edit", callback_data="list_recurring")],
         [InlineKeyboardButton("Stop All", callback_data="stop_all_recurring")],
         [InlineKeyboardButton("Back", callback_data="back_main")]
     ]
@@ -86,10 +97,8 @@ def has_link_or_mention(message: types.Message):
     entities = message.entities or [] + (message.caption_entities or [])
     for e in entities:
         if e.type in [
-            MessageEntityType.URL,
-            MessageEntityType.TEXT_LINK,
-            MessageEntityType.MENTION,
-            MessageEntityType.TEXT_MENTION
+            MessageEntityType.URL, MessageEntityType.TEXT_LINK,
+            MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION
         ]:
             return True
     text = message.text or message.caption or ""
@@ -103,44 +112,41 @@ def contains_banned_word(text: str, banned: list):
 
 # ================ RECURRING LOOP ================
 async def send_recurring(chat_id: int):
-    group = await groups.find_one({"chat_id": str(chat_id)})
-    if not group or not group.get("recurring_data"):
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(chat_id))
+    if not group or not group.recurring_data:
         return
 
     now = datetime.now().timestamp()
     updated = False
-    new_data = []
 
-    for item in group["recurring_data"]:
-        if now - item.get("last_sent", 0) < item["interval"]:
-            new_data.append(item)
+    for item in group.recurring_data:
+        if now - item.last_sent < item.interval:
             continue
 
         builder = InlineKeyboardBuilder()
-        for b in item.get("buttons", []):
+        for b in item.buttons:
             builder.row(InlineKeyboardButton(text=b["text"], url=b["url"]))
 
         try:
-            if item["type"] == "photo":
-                await bot.send_photo(chat_id, item["file_id"], caption=item["text"], reply_markup=builder.as_markup())
-            elif item["type"] == "video":
-                await bot.send_video(chat_id, item["file_id"], caption=item["text"], reply_markup=builder.as_markup())
+            if item.type == "photo":
+                await bot.send_photo(chat_id, item.file_id, caption=item.text, reply_markup=builder.as_markup())
+            elif item.type == "video":
+                await bot.send_video(chat_id, item.file_id, caption=item.text, reply_markup=builder.as_markup())
             else:
-                await bot.send_message(chat_id, item["text"], reply_markup=builder.as_markup(), disable_web_page_preview=True)
-            item["last_sent"] = now
+                await bot.send_message(chat_id, item.text, reply_markup=builder.as_markup(), disable_web_page_preview=True)
+            item.last_sent = now
             updated = True
         except Exception as e:
             log.error(f"Send error: {e}")
-        new_data.append(item)
 
     if updated:
-        await groups.update_one({"chat_id": str(chat_id)}, {"$set": {"recurring_data": new_data}})
+        await group.save()
 
 async def recurring_loop():
     while True:
         await asyncio.sleep(60)
-        async for group in groups.find({"recurring_data": {"$ne": []}}):
-            asyncio.create_task(send_recurring(int(group["chat_id"])))
+        async for group in GroupConfig.find({"recurring_data.0": {"$exists": True}}):
+            asyncio.create_task(send_recurring(int(group.chat_id)))
 
 # ================ MESSAGE HANDLER ================
 @dp.message()
@@ -149,29 +155,23 @@ async def handle_message(message: types.Message):
         return
 
     chat_id = str(message.chat.id)
-    group = await groups.find_one({"chat_id": chat_id})
+    group = await GroupConfig.find_one(GroupConfig.chat_id == chat_id)
 
     if not group:
-        await groups.insert_one({
-            "chat_id": chat_id,
-            "recurring_data": [],
-            "anti_link": True,
-            "anti_mention": True,
-            "banned_words": []
-        })
-        group = {"anti_link": True, "anti_mention": True, "banned_words": []}
+        group = GroupConfig(chat_id=chat_id)
+        await group.insert()
 
     if message.from_user and await is_admin(message.chat.id, message.from_user.id):
         return
 
-    if (group.get("anti_link") or group.get("anti_mention")) and has_link_or_mention(message):
+    if (group.anti_link or group.anti_mention) and has_link_or_mention(message):
         try:
             await message.delete()
         except:
             pass
 
     text = message.text or message.caption or ""
-    if group.get("banned_words") and contains_banned_word(text, group["banned_words"]):
+    if group.banned_words and contains_banned_word(text, group.banned_words):
         try:
             await message.delete()
         except:
@@ -191,11 +191,11 @@ async def back_main(callback: CallbackQuery):
 # --- RECURRING ---
 @dp.callback_query(lambda c: c.data == "recurring")
 async def panel_recurring(callback: CallbackQuery):
-    group = await groups.find_one({"chat_id": str(callback.message.chat.id)})
-    count = len(group.get("recurring_data", [])) if group else 0
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(callback.message.chat.id))
+    count = len(group.recurring_data) if group else 0
     await callback.message.edit_text(
         f"<b>Recurring Ads</b>\nActive: {count}",
-        reply_markup=get_recurring_panel(count)
+        reply_markup=get_recurring_panel()
     )
 
 @dp.callback_query(lambda c: c.data == "add_recurring")
@@ -207,9 +207,9 @@ async def add_recurring_start(callback: CallbackQuery, state: FSMContext):
 async def get_content(message: types.Message, state: FSMContext):
     data = {"text": message.caption or message.text or "", "type": "text", "file_id": None}
     if message.photo:
-        data.update({"type": "photo", "file_id": message.photo[-1].file_id, "text": message.caption or ""})
+        data.update({"type": "photo", "file_id": message.photo[-1].file_id})
     elif message.video:
-        data.update({"type": "video", "file_id": message.video.file_id, "text": message.caption or ""})
+        data.update({"type": "video", "file_id": message.video.file_id})
     await state.update_data(content=data)
     await message.reply("Interval in minutes:")
     await state.set_state(RecurringStates.waiting_interval)
@@ -232,31 +232,38 @@ async def get_buttons(message: types.Message, state: FSMContext):
                 t, u = line.split("|", 1)
                 buttons.append({"text": t.strip(), "url": u.strip()})
     content = data["content"]
-    content.update({"buttons": buttons, "interval": data["interval"], "last_sent": 0})
-    await save_recurring(message, state, content)
-
-async def save_recurring(message: types.Message, state: FSMContext, content: dict):
-    chat_id = str(message.chat.id)
-    group = await groups.find_one({"chat_id": chat_id})
-    recurring = group.get("recurring_data", []) if group else []
-    recurring.append(content)
-    await groups.update_one({"chat_id": chat_id}, {"$set": {"recurring_data": recurring}}, upsert=True)
+    content.update({
+        "buttons": buttons,
+        "interval": data["interval"],
+        "last_sent": 0
+    })
+    msg = RecurringMessage(**content)
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(message.chat.id))
+    if not group:
+        group = GroupConfig(chat_id=str(message.chat.id))
+    group.recurring_data.append(msg)
+    await group.save()
     await message.reply("Recurring saved!", reply_markup=get_main_panel())
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "stop_all_recurring")
 async def stop_all(callback: CallbackQuery):
-    await groups.update_one({"chat_id": str(callback.message.chat.id)}, {"$set": {"recurring_data": []}})
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(callback.message.chat.id))
+    if group:
+        group.recurring_data = []
+        await group.save()
     await callback.message.edit_text("All stopped.", reply_markup=get_main_panel())
 
 # --- TOGGLES ---
 @dp.callback_query(lambda c: c.data in ["toggle_link", "toggle_mention"])
 async def toggle_feature(callback: CallbackQuery):
     field = "anti_link" if callback.data == "toggle_link" else "anti_mention"
-    group = await groups.find_one({"chat_id": str(callback.message.chat.id)})
-    val = not group.get(field, True) if group else False
-    await groups.update_one({"chat_id": str(callback.message.chat.id)}, {"$set": {field: val}}, upsert=True)
-    await callback.answer(f"{field.replace('_', ' ').title()}: {'ON' if val else 'OFF'}")
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(callback.message.chat.id))
+    if not group:
+        group = GroupConfig(chat_id=str(callback.message.chat.id))
+    setattr(group, field, not getattr(group, field))
+    await group.save()
+    await callback.answer(f"{field.replace('_', ' ').title()}: {'ON' if getattr(group, field) else 'OFF'}")
 
 # --- BANNED WORDS ---
 @dp.callback_query(lambda c: c.data == "banned_words")
@@ -271,22 +278,27 @@ async def add_banned_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(PanelStates.waiting_banned_word)
 async def save_banned(message: types.Message, state: FSMContext):
     word = message.text.strip()
-    chat_id = str(message.chat.id)
-    group = await groups.find_one({"chat_id": chat_id})
-    words = group.get("banned_words", []) if group else []
-    if word not in words:
-        words.append(word)
-        await groups.update_one({"chat_id": chat_id}, {"$set": {"banned_words": words}}, upsert=True)
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(message.chat.id))
+    if not group:
+        group = GroupConfig(chat_id=str(message.chat.id))
+    if word not in group.banned_words:
+        group.banned_words.append(word)
+        await group.save()
     await message.reply(f"Banned: `{word}`", reply_markup=get_main_panel())
     await state.clear()
 
 @dp.callback_query(lambda c: c.data == "clear_banned")
 async def clear_banned(callback: CallbackQuery):
-    await groups.update_one({"chat_id": str(callback.message.chat.id)}, {"$set": {"banned_words": []}})
+    group = await GroupConfig.find_one(GroupConfig.chat_id == str(callback.message.chat.id))
+    if group:
+        group.banned_words = []
+        await group.save()
     await callback.message.edit_text("Cleared.", reply_markup=get_main_panel())
 
 # ================ STARTUP ================
 async def on_startup():
+    client = AsyncIOMotorClient(MONGODB_URL)
+    await init_beanie(database=client[DB_NAME], document_models=[GroupConfig])
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_my_commands([types.BotCommand(command="panel", description="Open panel")])
 
