@@ -1,14 +1,13 @@
 import asyncio
 import logging
 import re
-import json
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import (
-    MessageEntityType, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, InputMediaPhoto, InputMediaVideo
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
+from aiogram.enums import MessageEntityType  # FIXED HERE
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -20,7 +19,7 @@ import os
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGODB_URL = os.getenv("MONGODB_URL")
-DB_NAME = "GroupMNG"
+DB_NAME = "group_guardian"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -44,7 +43,6 @@ class RecurringStates(StatesGroup):
     waiting_content = State()
     waiting_interval = State()
     waiting_buttons = State()
-    waiting_edit_id = State()
 
 # ================ PANEL ================
 def get_main_panel():
@@ -87,8 +85,12 @@ async def is_admin(chat_id: int, user_id: int):
 def has_link_or_mention(message: types.Message):
     entities = message.entities or [] + (message.caption_entities or [])
     for e in entities:
-        if e.type in [MessageEntityType.URL, MessageEntityType.TEXT_LINK,
-                      MessageEntityType.MENTION, MessageEntityType.TEXT_MENTION]:
+        if e.type in [
+            MessageEntityType.URL,
+            MessageEntityType.TEXT_LINK,
+            MessageEntityType.MENTION,
+            MessageEntityType.TEXT_MENTION
+        ]:
             return True
     text = message.text or message.caption or ""
     return bool(re.search(r'http[s]?://|www\.|t\.me|@', text))
