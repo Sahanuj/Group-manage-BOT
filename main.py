@@ -10,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
 from beanie import Document, init_beanie
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
@@ -24,7 +25,9 @@ DB_NAME = "group_guardian"
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+# FIXED: Use DefaultBotProperties
+default_props = DefaultBotProperties(parse_mode="HTML")
+bot = Bot(token=BOT_TOKEN, default=default_props)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -133,7 +136,10 @@ async def send_recurring(chat_id: int):
             elif item.type == "video":
                 await bot.send_video(chat_id, item.file_id, caption=item.text, reply_markup=builder.as_markup())
             else:
-                await bot.send_message(chat_id, item.text, reply_markup=builder.as_markup(), disable_web_page_preview=True)
+                await bot.send_message(
+                    chat_id, item.text, reply_markup=builder.as_markup(),
+                    disable_web_page_preview=True  # This is now allowed in send_message
+                )
             item.last_sent = now
             updated = True
         except Exception as e:
