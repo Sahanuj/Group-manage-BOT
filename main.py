@@ -21,8 +21,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGODB_URL = os.getenv("MONGODB_URL")
 
-if not MONGODB_URL:
-    raise ValueError("MONGODB_URL is missing!")
+if not BOT_TOKEN or not MONGODB_URL:
+    raise ValueError("Missing BOT_TOKEN or MONGODB_URL!")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ bot = Bot(token=BOT_TOKEN, default=default_props)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ================ BEANIE MODELS ================
+# ================ MODELS ================
 class RecurringMessage(BaseModel):
     type: str
     text: str
@@ -60,28 +60,27 @@ class RecurringStates(StatesGroup):
     waiting_interval = State()
     waiting_buttons = State()
 
-# ================ PANEL ================
+# ================ PANELS ================
 def get_main_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Recurring Ads", callback_data="recurring")],
-        [InlineKeyboardButton("Anti-Link", callback_data="toggle_link"),
-         InlineKeyboardButton("Anti-Mention", callback_data="toggle_mention")],
-        [InlineKeyboardButton("Banned Words", callback_data="banned_words")],
-        [InlineKeyboardButton("Back", callback_data="back_main")]
+        [InlineKeyboardButton("📢 Recurring Ads", callback_data="recurring")],
+        [InlineKeyboardButton("🔗 Anti-Link", callback_data="toggle_link"),
+         InlineKeyboardButton("🔔 Anti-Mention", callback_data="toggle_mention")],
+        [InlineKeyboardButton("🚫 Banned Words", callback_data="banned_words")],
     ])
 
 def get_recurring_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Add New", callback_data="add_recurring")],
-        [InlineKeyboardButton("Stop All", callback_data="stop_all_recurring")],
-        [InlineKeyboardButton("Back", callback_data="back_main")]
+        [InlineKeyboardButton("➕ Add New", callback_data="add_recurring")],
+        [InlineKeyboardButton("🛑 Stop All", callback_data="stop_all_recurring")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
 
 def get_banned_words_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Add Word", callback_data="add_banned")],
-        [InlineKeyboardButton("Clear All", callback_data="clear_banned")],
-        [InlineKeyboardButton("Back", callback_data="back_main")]
+        [InlineKeyboardButton("➕ Add Word", callback_data="add_banned")],
+        [InlineKeyboardButton("🗑️ Clear All", callback_data="clear_banned")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_main")]
     ])
 
 # ================ HELPERS ================
@@ -106,21 +105,17 @@ def contains_banned_word(text: str, banned: list):
     text = text.lower()
     return any(w.lower() in text for w in banned)
 
-# ================ RECURRING ================
+# ================ RECURRING LOOP ================
 async def send_recurring(chat_id: int):
     group = await GroupConfig.find_one(GroupConfig.chat_id == str(chat_id))
     if not group or not group.recurring_data: return
-
     now = datetime.now().timestamp()
     updated = False
-
     for item in group.recurring_data:
         if now - item.last_sent < item.interval: continue
-
         builder = InlineKeyboardBuilder()
         for b in item.buttons:
             builder.row(InlineKeyboardButton(text=b["text"], url=b["url"]))
-
         try:
             if item.type == "photo":
                 await bot.send_photo(chat_id, item.file_id, caption=item.text, reply_markup=builder.as_markup())
@@ -132,7 +127,6 @@ async def send_recurring(chat_id: int):
             updated = True
         except Exception as e:
             log.error(f"Send error: {e}")
-
     if updated: await group.save()
 
 async def recurring_loop():
@@ -141,48 +135,57 @@ async def recurring_loop():
         async for group in GroupConfig.find({"recurring_data.0": {"$exists": True}}):
             asyncio.create_task(send_recurring(int(group.chat_id)))
 
-# ================ MESSAGE HANDLER (GROUP ONLY) ================
+# ================ GROUP HANDLER ================
 @dp.message()
 async def handle_message(message: types.Message):
     if message.chat.type not in ["supergroup", "group"]: return
-
     chat_id = str(message.chat.id)
     group = await GroupConfig.find_one(GroupConfig.chat_id == chat_id)
     if not group:
         group = GroupConfig(chat_id=chat_id)
         await group.insert()
-
     if message.from_user and await is_admin(message.chat.id, message.from_user.id): return
-
     if (group.anti_link or group.anti_mention) and has_link_or_mention(message):
         try: await message.delete()
         except: pass
-
     text = message.text or message.caption or ""
     if group.banned_words and contains_banned_word(text, group.banned_words):
         try: await message.delete()
         except: pass
 
-# ================ PANEL — DM ONLY ================
+# ================ PANEL — DM ONLY + LOG ================
 @dp.message(Command("panel"))
 async def panel_cmd(message: types.Message):
+    log.info(f"/panel from {message.from_user.id} in {message.chat.type}")
     if message.from_user.id != OWNER_ID:
+        log.info("Not owner")
         return
     if message.chat.type != "private":
-        return await message.reply("Use /panel in private chat with me.")
-
-    await message.reply("Group Guardian Panel", reply_markup=get_main_panel())
+        await message.reply("❌ Use /panel in **private chat** with me.")
+        return
+    await message.reply(
+        "<b>🔐 Group Guardian Panel</b>\n"
+        "Control all groups from here.",
+        reply_markup=get_main_panel()
+    )
 
 @dp.callback_query(lambda c: c.data == "back_main")
 async def back_main(callback: CallbackQuery):
-    await callback.message.edit_text("Group Guardian Panel", reply_markup=get_main_panel())
+    await callback.message.edit_text(
+        "<b>🔐 Group Guardian Panel</b>\n"
+        "Control all groups from here.",
+        reply_markup=get_main_panel()
+    )
 
 # --- RECURRING ---
 @dp.callback_query(lambda c: c.data == "recurring")
 async def panel_recurring(callback: CallbackQuery):
     group = await GroupConfig.find_one(GroupConfig.chat_id == str(callback.message.chat.id))
     count = len(group.recurring_data) if group else 0
-    await callback.message.edit_text(f"<b>Recurring Ads</b>\nActive: {count}", reply_markup=get_recurring_panel())
+    await callback.message.edit_text(
+        f"<b>📢 Recurring Ads</b>\nActive: {count}",
+        reply_markup=get_recurring_panel()
+    )
 
 @dp.callback_query(lambda c: c.data == "add_recurring")
 async def add_recurring_start(callback: CallbackQuery, state: FSMContext):
@@ -192,15 +195,18 @@ async def add_recurring_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(RecurringStates.waiting_content)
 async def get_content(message: types.Message, state: FSMContext):
     data = {"text": message.caption or message.text or "", "type": "text", "file_id": None}
-    if message.photo: data.update({"type": "photo", "file_id": message.photo[-1].file_id})
-    elif message.video: data.update({"type": "video", "file_id": message.video.file_id})
+    if message.photo:
+        data.update({"type": "photo", "file_id": message.photo[-1].file_id})
+    elif message.video:
+        data.update({"type": "video", "file_id": message.video.file_id})
     await state.update_data(content=data)
     await message.reply("Interval in minutes:")
     await state.set_state(RecurringStates.waiting_interval)
 
 @dp.message(RecurringStates.waiting_interval)
 async def get_interval(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) < 1: return await message.reply("Number > 0")
+    if not message.text.isdigit() or int(message.text) < 1:
+        return await message.reply("Number > 0")
     await state.update_data(interval=int(message.text) * 60)
     await message.reply("Add buttons? (Yes/No)")
     await state.set_state(RecurringStates.waiting_buttons)
@@ -243,7 +249,7 @@ async def toggle(callback: CallbackQuery):
 # --- BANNED WORDS ---
 @dp.callback_query(lambda c: c.data == "banned_words")
 async def banned_menu(callback: CallbackQuery):
-    await callback.message.edit_text("Banned Words", reply_markup=get_banned_words_panel())
+    await callback.message.edit_text("🚫 Banned Words", reply_markup=get_banned_words_panel())
 
 @dp.callback_query(lambda c: c.data == "add_banned")
 async def add_banned_start(callback: CallbackQuery, state: FSMContext):
@@ -274,7 +280,9 @@ async def on_startup():
     await init_beanie(database=client["group_guardian"], document_models=[GroupConfig])
     log.info("MongoDB connected!")
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_my_commands([types.BotCommand(command="panel", description="Open panel (DM only)")], scope=types.BotCommandScopeDefault())
+    await bot.set_my_commands([
+        types.BotCommand(command="panel", description="Open panel (DM only)")
+    ], scope=types.BotCommandScopeDefault())
 
 async def main():
     dp.startup.register(on_startup)
